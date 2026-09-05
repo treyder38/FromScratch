@@ -41,6 +41,7 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         return x
 
+
 class Router(nn.Module):
 
     def __init__(self, config):
@@ -54,6 +55,7 @@ class Router(nn.Module):
             prop = F.softmax(logits, dim=-1)
         return prop, logits
 
+
 class MoE(nn.Module):
 
     def __init__(self, config):
@@ -63,6 +65,7 @@ class MoE(nn.Module):
         self.experts = nn.ModuleList([MLP(config) for _ in range(config.n_experts)])
         self.router = Router(config)
         self.stats = {}
+        self.aux = 0.0
 
     def forward(self, x):
         prob, logits = self.router(x) # (B, T, n_experts)
@@ -73,6 +76,7 @@ class MoE(nn.Module):
         x_flat = x.view(B * T, C)                          # (N, C)
         idx_flat = topk_indices.view(B * T, self.top_k)    # (N, top_k) -> indexes of experts
         prob_flat = topk_probs.view(B * T, self.top_k)     # (N, top_k) -> probabilities of experts
+        fraction = torch.zeros(self.n_experts, device=x.device)  # fraction of tokens assigned to i_th expert
 
         out = torch.zeros_like(x_flat)
 
@@ -83,10 +87,16 @@ class MoE(nn.Module):
             y = expert(x_flat[token_idx])                   # (sel_tokens, C)
             y *= (prob_flat[token_idx, slot].unsqueeze(-1)) # weight from router
             out.index_add_(0, token_idx, y.to(out.dtype))
+            fraction[e] += y.shape[0]
+
+        fraction /= B * T
+        P = prob.reshape(-1, self.n_experts).mean(dim=0)   # (n_experts, )
 
         with torch.no_grad():
-            load = F.one_hot(idx_flat, self.n_experts).sum(dim=1).float().mean(dim=0)
-            self.stats = {"load_min": load.min(), "load_max": load.max()}
+            # load = F.one_hot(idx_flat, self.n_experts).sum(dim=1).float().mean(dim=0)
+            self.stats = {"load_min": fraction.min(), "load_max": fraction.max()}
+
+        self.aux = self.n_experts * (fraction * P).sum()
 
         return out.view(B, T, C)
 
@@ -220,5 +230,9 @@ class GPT(nn.Module):
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.view(B * T, logits.size(-1)), targets.view(B * T))
+            # add low balancing loss
+            if self.config.use_moe:
+                loss_lb = sum(b.mlp.aux for b in self.transformer.h if isinstance(b.mlp, MoE))
+                loss += self.config.lb_loss_coef * loss_lb
 
         return logits, loss
