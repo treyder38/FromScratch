@@ -24,7 +24,7 @@ class Logger:
         self.run_dir = os.path.join(log_dir, run_name)
         os.makedirs(self.run_dir, exist_ok=True)
         self.config_path = os.path.join(self.run_dir, "config.json")
-        self.metrics = open(os.path.join(self.run_dir, "train.json"), "a")
+        self.metrics = open(os.path.join(self.run_dir, "train.jsonl"), "a")
 
         self.log = logging.getLogger(run_name)
         self.log.setLevel(logging.INFO)
