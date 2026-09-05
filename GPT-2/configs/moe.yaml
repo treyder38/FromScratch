@@ -1,0 +1,40 @@
+# GPT-2 124M body with MoE in place of every MLP. Short run for routing experiments.
+#   torchrun --standalone --nproc_per_node=4 train.py --config configs/moe.yaml
+
+model:
+  block_size: 1024
+  vocab_size: 50304
+  n_layer: 12
+  n_head: 12
+  n_emb: 768
+  use_moe: true
+  n_experts: 2
+  top_k: 2
+  moe_every: 1
+  lb_loss_coef: 0.0
+  z_loss_coef: 0.0
+
+train:
+  batch_size: 524288
+  B: 32                   # top-2 doubles MLP activations vs dense; B=64 OOMs on 80GB
+  T: 1024
+  max_lr: 6.0e-4
+  min_lr_ratio: 0.1
+  warmup_steps: 715
+  max_steps: 1000
+  weight_decay: 0.1
+  grad_clip: 1.0
+  seed: 1337
+  data_root: edu_fineweb10B
+  compile: true
+
+  val_every: 100
+  val_loss_steps: 20
+  sample_every: 1000
+  num_samples: 4
+  sample_len: 32
+  sample_prompt: "Hello, I'm a language model,"
+  ckpt_every: 5000
+
+  log_dir: log
+  wandb_project: gpt2-fromscratch

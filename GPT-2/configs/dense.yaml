@@ -1,0 +1,41 @@
+# GPT-2 124M, dense baseline (GPT-3 small schedule on 10B FineWeb-Edu tokens)
+#   python train.py --config configs/dense.yaml
+#   torchrun --standalone --nproc_per_node=4 train.py --config configs/dense.yaml
+
+model:
+  block_size: 1024        # max sequence length
+  vocab_size: 50304       # 50257 padded up to a multiple of 128
+  n_layer: 12
+  n_head: 12
+  n_emb: 768
+  use_moe: false
+  n_experts: 1
+  top_k: 1
+  moe_every: 1
+  lb_loss_coef: 0.0       # load balancing loss
+  z_loss_coef: 0.0        # router z-loss
+
+train:
+  batch_size: 524288      # tokens per optimizer step (~0.5M like GPT-3 small)
+  B: 64                   # micro batch size per GPU
+  T: 1024                 # context length
+  max_lr: 6.0e-4          # note: YAML needs "6.0e-4", plain "6e-4" is parsed as a string
+  min_lr_ratio: 0.1       # min_lr = min_lr_ratio * max_lr
+  warmup_steps: 715       # first ~350M tokens
+  max_steps: 19073        # 10B tokens / batch_size
+  weight_decay: 0.1
+  grad_clip: 1.0
+  seed: 1337
+  data_root: edu_fineweb10B
+  compile: true
+
+  val_every: 100
+  val_loss_steps: 20
+  sample_every: 1000
+  num_samples: 4
+  sample_len: 32
+  sample_prompt: "Hello, I'm a language model,"
+  ckpt_every: 5000
+
+  log_dir: log
+  wandb_project: gpt2-fromscratch   # WANDB_MODE=offline|disabled to skip the network

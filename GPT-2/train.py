@@ -1,12 +1,15 @@
 import os
 import math 
 import time
+import yaml
 import torch 
+import argparse
 import tiktoken
 import numpy as np
 import torch.distributed
 import json, logging, datetime
 from dataclasses import asdict
+from types import SimpleNamespace
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
@@ -14,12 +17,11 @@ from torch.distributed import init_process_group, destroy_process_group
 from gpt import GPT, GPTconfig, MoE
 
 """ 
-Simple run   -> python train.py
-MultiGPU run -> torchrun --standalone --nproc_per_node=4 train.py 
+Simple run   -> python train.py --config configs/dense.yaml
+MultiGPU run -> torchrun --standalone --nproc_per_node=4 train.py --config configs/moe.yaml
 """
 
 # -----------------------------------
-
 
 class Logger:
     """Local jsonl + terminal logging, optionally mirrored to Weights & Biases."""
@@ -140,6 +142,15 @@ class DataLoaderLite:
 
 if __name__ == "__main__":
 
+    # config reading
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default="configs/dense.yaml")
+    args = parser.parse_args()
+    with open(args.config) as f:
+        config = yaml.safe_load(f)
+    model_cfg = GPTconfig(**config["model"])
+    cfg = SimpleNamespace(**config["train"])
+
     # set up DDP
     ddp = int(os.environ.get('RANK', -1)) != -1
     if ddp:
@@ -164,46 +175,42 @@ if __name__ == "__main__":
 
     # setup logger
     run_name = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_dir = "log"
-    wandb_project = os.environ.get("WANDB_PROJECT", "gpt2-fromscratch")  # WANDB_MODE=disabled to turn off
-    logger = Logger(log_dir, run_name, enabled=master_process, wandb_project=wandb_project)
+    wandb_project = os.environ.get("WANDB_PROJECT", cfg.wandb_project)  # WANDB_MODE=disabled to turn off
+    logger = Logger(cfg.log_dir, run_name, enabled=master_process, wandb_project=wandb_project)
+    logger.info(f"config: {args.config}")
     logger.info(f"using device: {device}")
 
     # reproducibility
-    torch.manual_seed(1337)
+    torch.manual_seed(cfg.seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(1337)
+        torch.cuda.manual_seed(cfg.seed)
 
     # precision
     torch.set_float32_matmul_precision('high')
 
     # batch size setup
-    batch_size = 524288  # ~0.5M like in GPT3 small
-    B, T = 64, 1024      # micro batch size & context length
-    assert batch_size % (B * T * ddp_world_size) == 0, f"make sure total_batch_size is divisible by B * T * ddp_world_size"
-    grad_accum_steps = batch_size // (B * T * ddp_world_size)
-    logger.info(f"total desired batch size: {batch_size}")
+    B, T = cfg.B, cfg.T
+    assert cfg.batch_size % (B * T * ddp_world_size) == 0, f"make sure batch_size is divisible by B * T * ddp_world_size"
+    grad_accum_steps = cfg.batch_size // (B * T * ddp_world_size)
+    logger.info(f"total desired batch size: {cfg.batch_size}")
     logger.info(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
     # data loader related to its process_rank
-    train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
-    val_loader   = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
+    train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train", data_root=cfg.data_root)
+    val_loader   = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val", data_root=cfg.data_root)
     logger.info(f"found {len(train_loader.shards)} shards for split train")
     logger.info(f"found {len(val_loader.shards)} shards for split val")
 
     # create model
-    vocab_size = 50304
-    model = GPT(GPTconfig(vocab_size=vocab_size))
+    model = GPT(model_cfg)
     model.to(device)
     raw_model = model
 
-    # lr scheduler & max steps
-    max_lr = 6e-4
-    min_lr = 0.1 * max_lr   # 10% of max_lr
-    warmup_steps   = 715    # first 350M tokens
-    # max_steps      = 19073
-    max_steps      = 1000
-    val_loss_steps = 20
+    # lr scheduler
+    max_lr = cfg.max_lr
+    min_lr = cfg.min_lr_ratio * max_lr
+    warmup_steps = cfg.warmup_steps
+    max_steps = cfg.max_steps
 
     def get_lr(it):
         if it < warmup_steps:
@@ -216,40 +223,35 @@ if __name__ == "__main__":
         return min_lr + coeff * (max_lr - min_lr)
 
     # optimizer
-    weight_decay = 0.1
-    optimizer = raw_model.configure_optimizer(weight_decay=weight_decay, lr=max_lr, device=device)
+    optimizer = raw_model.configure_optimizer(weight_decay=cfg.weight_decay, lr=max_lr, device=device)
     decay_params, nodecay_params = optimizer.param_groups[0]['params'], optimizer.param_groups[1]['params']
     logger.info(f"num decayed parameter tensors: {len(decay_params)}, with {sum(p.numel() for p in decay_params):,} params")
     logger.info(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {sum(p.numel() for p in nodecay_params):,} params")
     logger.info(f"using fused AdamW: {optimizer.defaults.get('fused', False)}")
 
     # MoE checks
-    if raw_model.config.use_moe:
-        assert raw_model.config.top_k <= raw_model.config.n_experts, f"top_k={raw_model.config.top_k} > n_experts={raw_model.config.n_experts}"
-        logger.info(f"using MoE every {raw_model.config.moe_every} layer with {raw_model.config.n_experts} experts")
+    if model_cfg.use_moe:
+        assert model_cfg.top_k <= model_cfg.n_experts, f"top_k={model_cfg.top_k} > n_experts={model_cfg.n_experts}"
+        logger.info(f"using MoE every {model_cfg.moe_every} layer with {model_cfg.n_experts} experts")
 
     # wrap model into DDP container
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank])
 
     # compile the model
-    logger.info("compiling the model...")
-    model = torch.compile(model)
+    if cfg.compile:
+        logger.info("compiling the model...")
+        model = torch.compile(model)
 
-    # logger config
-    logger.set_config({
-        **asdict(raw_model.config),
-        "batch_size": batch_size, "B": B, "T": T,
-        "max_lr": max_lr, "min_lr": min_lr,
-        "warmup_steps": warmup_steps, "max_steps": max_steps,
-        "world_size": ddp_world_size, "weight_decay": weight_decay,
-    })
+    # logger config: everything needed to reproduce the run
+    logger.set_config({**config, "config_file": args.config,
+                       "world_size": ddp_world_size, "grad_accum_steps": grad_accum_steps})
 
     # main loop
     for step in range(max_steps):
 
         # validation
-        if step % 100 == 0:
+        if step % cfg.val_every == 0:
 
             model.eval()
 
@@ -259,12 +261,12 @@ if __name__ == "__main__":
             val_loader.reset()
             with torch.no_grad():
                 val_loss_accum = torch.zeros((), device=device)
-                for _ in range(val_loss_steps):
+                for _ in range(cfg.val_loss_steps):
                     x, y = val_loader.next_batch()
                     x, y = x.to(device), y.to(device)
                     with torch.autocast(device_type=device, dtype=torch.bfloat16):
                         logits, loss = model(x, y)
-                    loss /= val_loss_steps
+                    loss /= cfg.val_loss_steps
                     val_loss_accum += loss.detach()
 
             # average val_loss_accum across all processes
@@ -278,18 +280,16 @@ if __name__ == "__main__":
             logger.metric(step=step, split="val", loss=val_loss_accum.item(), dt=dt)
 
         # sample tokens from the model
-        if step > 0 and step % 1000 == 0:
+        if step > 0 and step % cfg.sample_every == 0:
             raw_model.eval()
-            num_return_sequences = 4
-            max_length = 32
             enc = tiktoken.get_encoding('gpt2')
-            tokens = enc.encode("Hello, I'm a language model,")
+            tokens = enc.encode(cfg.sample_prompt)
             tokens = torch.tensor(tokens, dtype=torch.long)
-            tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (num_return_sequences, tokens.shape)
+            tokens = tokens.unsqueeze(0).repeat(cfg.num_samples, 1) # (num_samples, len(prompt))
             xgen = tokens.to(device) 
             sample_rng = torch.Generator(device=device)
             sample_rng.manual_seed(42 + ddp_rank)
-            while xgen.size(1) < max_length:
+            while xgen.size(1) < cfg.sample_len:
                 with torch.no_grad():
                     with torch.autocast(device_type=device, dtype=torch.bfloat16):
                         # use raw_model to avoid recompilation
@@ -297,7 +297,6 @@ if __name__ == "__main__":
                     logits = logits[:, -1, :]  # (B, vocab_size)
                     probs = F.softmax(logits, dim=-1)
                     # do top-k sampling of 50
-                    # topk_probs is (5, 50), topk_indices is (5, 50)
                     topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
                     # select a token from the top-k probabilities
                     ix = torch.multinomial(topk_probs, 1, generator=sample_rng) # (B, 1)
@@ -306,7 +305,7 @@ if __name__ == "__main__":
                     xgen = torch.cat((xgen, xcol), dim=1)
 
             # log the generated text
-            logger.samples(step, [enc.decode(xgen[i, :max_length].tolist()) for i in range(num_return_sequences)])
+            logger.samples(step, [enc.decode(xgen[i, :cfg.sample_len].tolist()) for i in range(cfg.num_samples)])
 
         # train
         model.train()
@@ -333,7 +332,7 @@ if __name__ == "__main__":
             torch.distributed.all_reduce(loss_accum, op=torch.distributed.ReduceOp.AVG)
         
         # gradients cliping
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
 
         # sync with lr schedule
         lr = get_lr(step)
@@ -349,7 +348,7 @@ if __name__ == "__main__":
 
         # logging
         moe_stats = {}
-        if raw_model.config.use_moe:
+        if model_cfg.use_moe:
             for ind, block in enumerate(raw_model.transformer.h):
                 if isinstance(block.mlp, MoE):
                     for k, v in block.mlp.stats.items():
@@ -361,14 +360,15 @@ if __name__ == "__main__":
                       **moe_stats)
 
         # save checkpoint
-        if master_process and (step > 0 and (step % 5000 == 0 or step == max_steps - 1)):
-            ckpt_path = os.path.join(log_dir, run_name, f"ckpt_{step:05d}.pt")
+        if master_process and (step > 0 and (step % cfg.ckpt_every == 0 or step == max_steps - 1)):
+            ckpt_path = os.path.join(cfg.log_dir, run_name, f"ckpt_{step:05d}.pt")
             logger.info(f"saving checkpoint at step {step} -> {ckpt_path}")
             torch.save({
                 'model': raw_model.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'step': step,
-                'config': asdict(raw_model.config),
+                'config': asdict(model_cfg),
+                'train_config': config["train"],
                 'train_loader': {'shard': train_loader.current_shard, 
                                  'position': train_loader.current_position},
                 'rng': {'torch': torch.get_rng_state(), 

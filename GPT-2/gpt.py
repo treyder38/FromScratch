@@ -17,10 +17,10 @@ class GPTconfig:
     n_head: int = 12
     n_emb: int = 768
 
-    # MoE settings
-    use_moe: bool = True
-    n_experts: int = 2
-    top_k: int = 2
+    # MoE settings (dense defaults, so checkpoints saved before MoE existed still load)
+    use_moe: bool = False
+    n_experts: int = 1
+    top_k: int = 1
     moe_every: int = 1
     lb_loss_coef: float = 0.0  # load balancing
     z_loss_coef: float = 0.0   # router z-loss
