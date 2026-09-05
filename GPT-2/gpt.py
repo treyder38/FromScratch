@@ -49,7 +49,7 @@ class Router(nn.Module):
 
     def forward(self, x):
         # router in fp32
-        with torch.autocast(device = x.device_type, enabled=False):
+        with torch.autocast(device_type=x.device.type, enabled=False):
             logits = self.proj(x.float())    # (B, T, n_experts)
             prop = F.softmax(logits, dim=-1)
         return prop, logits
@@ -59,6 +59,7 @@ class MoE(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.top_k = config.top_k
+        self.n_experts = config.n_experts
         self.experts = nn.ModuleList([MLP(config) for _ in range(config.n_experts)])
         self.router = Router(config)
         self.stats = {}
