@@ -22,8 +22,8 @@ class GPTconfig:
     n_experts: int = 1
     top_k: int = 1
     moe_every: int = 1
-    lb_loss_coef: float = 0.0  # load balancing
-    z_loss_coef: float = 0.0   # router z-loss
+    lb_loss_coef: float = 0.01  # load balancing
+    z_loss_coef: float = 1e-3   # router z-loss
 
 
 class MLP(nn.Module):
@@ -66,6 +66,7 @@ class MoE(nn.Module):
         self.router = Router(config)
         self.stats = {}
         self.aux = 0.0
+        self.z_loss = 0.0
 
     def forward(self, x):
         prob, logits = self.router(x) # (B, T, n_experts)
@@ -97,6 +98,7 @@ class MoE(nn.Module):
             self.stats = {"load_min": fraction.min(), "load_max": fraction.max()}
 
         self.aux = self.n_experts * (fraction * P).sum()
+        self.z_loss = torch.logsumexp(logits, dim=-1).pow(2).mean()
 
         return out.view(B, T, C)
 
@@ -233,6 +235,7 @@ class GPT(nn.Module):
             # add low balancing loss
             if self.config.use_moe:
                 loss_lb = sum(b.mlp.aux for b in self.transformer.h if isinstance(b.mlp, MoE))
-                loss += self.config.lb_loss_coef * loss_lb
+                loss_z  = sum(b.mlp.z_loss for b in self.transformer.h if isinstance(b.mlp, MoE))
+                loss += self.config.lb_loss_coef * loss_lb + self.config.z_loss_coef * loss_z
 
         return logits, loss
