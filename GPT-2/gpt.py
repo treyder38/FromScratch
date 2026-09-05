@@ -9,14 +9,24 @@ from torch.nn import functional as F
 
 @dataclass
 class GPTconfig:
+
+    # Common settings
     block_size: int = 1024 # max sequence length
     vocab_size: int = 50257
     n_layer: int = 12
     n_head: int = 12
     n_emb: int = 768
 
+    # MoE settings
+    use_moe: bool = True
+    n_experts: int = 1
+    top_k: int = 2
+    moe_every: int = 1
+    lb_loss_coef: float = 0.0  # load balancing
+    z_loss_coef: float = 0.0   # router z-loss
 
-class MLP(nn.Sequential):
+
+class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
@@ -24,6 +34,60 @@ class MLP(nn.Sequential):
         self.gelu   = nn.GELU(approximate='tanh')
         self.c_proj = nn.Linear(4 * config.n_emb, config.n_emb)
         self.c_proj.NANOGPT_SCALE_INIT = 1
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = self.gelu(x)
+        x = self.c_proj(x)
+        return x
+
+class Router(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.proj = nn.Linear(config.n_emb, config.n_experts, bias=False)
+
+    def forward(self, x):
+        # router in fp32
+        with torch.autocast(device = x.device_type, enabled=False):
+            logits = self.proj(x.float())    # (B, T, n_experts)
+            prop = F.softmax(logits, dim=-1)
+        return prop, logits
+
+class MoE(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.top_k = config.top_k
+        self.experts = nn.ModuleList([MLP(config) for _ in range(config.n_experts)])
+        self.router = Router(config)
+        self.stats = {}
+
+    def forward(self, x):
+        prob, logits = self.router(x) # (B, T, n_experts)
+        topk_probs, topk_indices = torch.topk(prob, self.top_k, dim=-1) 
+        topk_probs /= topk_probs.sum(dim=-1, keepdim=True) # rebalance weights
+
+        B, T, C = x.shape
+        x_flat = x.view(B * T, C)                          # (N, C)
+        idx_flat = topk_indices.view(B * T, self.top_k)    # (N, top_k) -> indexes of experts
+        prob_flat = topk_probs.view(B * T, self.top_k)     # (N, top_k) -> probabilities of experts
+
+        out = torch.zeros_like(x_flat)
+
+        for e, expert in enumerate(self.experts):
+            token_idx, slot = torch.where(idx_flat == e)
+            # token_idx -> index in x_flat
+            # slot -> place of match in a row
+            y = expert(x_flat[token_idx])                   # (sel_tokens, C)
+            y *= (prob_flat[token_idx, slot].unsqueeze(-1)) # weight from router
+            out.index_add_(0, token_idx, y.to(out.dtype))
+
+        with torch.no_grad():
+            load = F.one_hot(idx_flat, self.n_experts).sum(dim=1).float().mean(dim=0)
+            self.stats = {"load_min": load.min(), "load_max": load.max()}
+
+        return out.view(B, T, C)
 
 
 class CausalSelfAttention(nn.Module):
@@ -67,12 +131,15 @@ class CausalSelfAttention(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, layer_ind):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_emb)
         self.ln_2 = nn.LayerNorm(config.n_emb)
         self.attn = CausalSelfAttention(config)
-        self.mlp = MLP(config)
+        if config.use_moe and layer_ind % config.moe_every == 0:
+            self.mlp = MoE(config)
+        else:
+            self.mlp = MLP(config)
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x)) # Pre Norm
@@ -91,7 +158,7 @@ class GPT(nn.Module):
             dict(
                 wte = nn.Embedding(config.vocab_size, config.n_emb),
                 wpe = nn.Embedding(config.block_size, config.n_emb),
-                h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+                h = nn.ModuleList([Block(config, ind) for ind in range(config.n_layer)]),
                 ln_f = nn.LayerNorm(config.n_emb)
             )
         )

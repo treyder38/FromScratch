@@ -11,7 +11,9 @@ from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from gpt import GPT, GPTconfig
+from gpt import GPT, GPTconfig, MoE
+
+""" MultiGPU run -> torchrun --standalone --nproc_per_node=4 train.py """
 
 # -----------------------------------
 
@@ -337,9 +339,17 @@ if __name__ == "__main__":
         tokens_per_sec = tokens_processed / dt
 
         # logging
+        if raw_model.use_moe:
+            moe_stats = {}
+            for ind, block in enumerate(raw_model.transformer.h):
+                if isinstance(block.mlp, MoE):
+                    for k, v in block.mlp.stats.items():
+                        moe_stats[f"{k}_l{ind}"] = v.item()
+
         logger.metric(step=step, split="train", loss=loss_accum.item(),
                       lr=lr, grad_norm=norm.item(), dt=dt, tok_per_sec=tokens_per_sec,
-                      mem_gb=torch.cuda.max_memory_allocated() / 1e9 if device.startswith("cuda") else 0)
+                      mem_gb=torch.cuda.max_memory_allocated() / 1e9 if device.startswith("cuda") else 0,
+                      **moe_stats)
 
         # save checkpoint
         if master_process and (step > 0 and (step % 5000 == 0 or step == max_steps - 1)):
