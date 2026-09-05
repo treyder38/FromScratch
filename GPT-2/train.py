@@ -17,8 +17,10 @@ from gpt import GPT, GPTconfig
 
 
 class Logger:
-    def __init__(self, log_dir, run_name, enabled=True):
+    """Local jsonl + terminal logging, optionally mirrored to Weights & Biases."""
+    def __init__(self, log_dir, run_name, enabled=True, wandb_project=None):
         self.enabled = enabled
+        self.wandb = None
         if not enabled:
             return
         self.run_dir = os.path.join(log_dir, run_name)
@@ -28,10 +30,19 @@ class Logger:
 
         self.log = logging.getLogger(run_name)
         self.log.setLevel(logging.INFO)
-        self.log.propagate = False        # не отдавать сообщения root-логгеру
-        handler = logging.StreamHandler() # только терминал
+        self.log.propagate = False
+        handler = logging.StreamHandler()
         handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s", datefmt="%H:%M:%S"))
         self.log.addHandler(handler)
+
+        if wandb_project is not None:
+            try:
+                import wandb
+                self.wandb = wandb.init(project=wandb_project, name=run_name, dir=self.run_dir)
+                self.info(f"wandb run: {self.wandb.url or f'{wandb.run.settings.mode} mode, id {self.wandb.id}'}")
+            except Exception as e:  # missing package, no login, no network: keep training
+                self.info(f"wandb disabled: {type(e).__name__}: {e}")
+                self.wandb = None
 
     def set_config(self, config):
         if not self.enabled:
@@ -39,22 +50,43 @@ class Logger:
         with open(self.config_path, "w") as f:
             json.dump(config, f, indent=2, default=str)
         self.info(f"config saved to {self.config_path}")
+        if self.wandb is not None:
+            self.wandb.config.update(config, allow_val_change=True)
 
-    def metric(self, **kw):
+    def metric(self, step, split, **kw):
+        """One record per call: written to train.jsonl, printed, and sent to wandb as {split}/{key}."""
         if not self.enabled:
             return
-        self.metrics.write(json.dumps(kw) + "\n")
+        record = {"step": step, "split": split, **kw}
+        self.metrics.write(json.dumps(record) + "\n")
         self.metrics.flush()
         self.info(" | ".join(f"{k} {v:.5g}" if isinstance(v, float) else f"{k} {v}"
-                             for k, v in kw.items()))
+                             for k, v in record.items()))
+        if self.wandb is not None:
+            self.wandb.log({f"{split}/{k}": v for k, v in kw.items()}, step=step)
+
+    def samples(self, step, texts):
+        """Generated text: printed line by line and stored as a wandb table."""
+        if not self.enabled:
+            return
+        for i, t in enumerate(texts):
+            self.info(f"sample {i} => {t}")
+        if self.wandb is not None:
+            import wandb
+            table = wandb.Table(columns=["step", "sample", "text"],
+                                data=[[step, i, t] for i, t in enumerate(texts)])
+            self.wandb.log({"samples": table}, step=step)
 
     def info(self, msg):
         if self.enabled:
             self.log.info(msg)
 
     def close(self):
-        if self.enabled:
-            self.metrics.close()
+        if not self.enabled:
+            return
+        self.metrics.close()
+        if self.wandb is not None:
+            self.wandb.finish()
 
 
 # -----------------------------------
@@ -128,7 +160,8 @@ if __name__ == "__main__":
     # setup logger
     run_name = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     log_dir = "log"
-    logger = Logger(log_dir, run_name, enabled=master_process)
+    wandb_project = os.environ.get("WANDB_PROJECT", "gpt2-fromscratch")  # WANDB_MODE=disabled to turn off
+    logger = Logger(log_dir, run_name, enabled=master_process, wandb_project=wandb_project)
     logger.info(f"using device: {device}")
 
     # reproducibility
@@ -261,11 +294,8 @@ if __name__ == "__main__":
                     xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
                     xgen = torch.cat((xgen, xcol), dim=1)
 
-            # print the generated text
-            for i in range(num_return_sequences):
-                tokens = xgen[i, :max_length].tolist()
-                decoded = enc.decode(tokens)
-                logger.info(f"rank {ddp_rank} sample {i} => {decoded}")
+            # log the generated text
+            logger.samples(step, [enc.decode(xgen[i, :max_length].tolist()) for i in range(num_return_sequences)])
 
         # train
         model.train()
@@ -319,7 +349,7 @@ if __name__ == "__main__":
                 'model': raw_model.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'step': step,
-                'config': asdict(raw_model.config),  # plain dict: loadable without importing this module
+                'config': asdict(raw_model.config),
                 'train_loader': {'shard': train_loader.current_shard, 
                                  'position': train_loader.current_position},
                 'rng': {'torch': torch.get_rng_state(), 
@@ -327,6 +357,7 @@ if __name__ == "__main__":
                 'val_loss': val_loss_accum.item(),
                 'run_name': run_name,
             }, ckpt_path)
+            logger.metric(step, "ckpt", path=ckpt_path, size_gb=os.path.getsize(ckpt_path) / 1e9)
 
     # cleanup all processes
     logger.close()

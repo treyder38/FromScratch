@@ -119,8 +119,7 @@ class GPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=std)
 
     def configure_optimizer(self, weight_decay, lr, device):
-        """Builds AdamW with weight decay applied only to >=2D tensors (matmuls, embeddings).
-        Logging of the parameter counts is left to the caller."""
+        """Builds AdamW with weight decay applied only to >=2D tensors (matmuls, embeddings)."""
         params_dict = {p_name : p for p_name, p in self.named_parameters() if p.requires_grad}
         decay_params   = [p for p in params_dict.values() if p.dim() >= 2]
         nodecay_params = [p for p in params_dict.values() if p.dim() < 2]
