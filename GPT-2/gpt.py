@@ -19,7 +19,7 @@ class GPTconfig:
 
     # MoE settings
     use_moe: bool = True
-    n_experts: int = 1
+    n_experts: int = 2
     top_k: int = 2
     moe_every: int = 1
     lb_loss_coef: float = 0.0  # load balancing

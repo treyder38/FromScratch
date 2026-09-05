@@ -13,7 +13,10 @@ from torch.distributed import init_process_group, destroy_process_group
 
 from gpt import GPT, GPTconfig, MoE
 
-""" MultiGPU run -> torchrun --standalone --nproc_per_node=4 train.py """
+""" 
+Simple run   -> python train.py
+MultiGPU run -> torchrun --standalone --nproc_per_node=4 train.py 
+"""
 
 # -----------------------------------
 
@@ -198,7 +201,8 @@ if __name__ == "__main__":
     max_lr = 6e-4
     min_lr = 0.1 * max_lr   # 10% of max_lr
     warmup_steps   = 715    # first 350M tokens
-    max_steps      = 19073
+    # max_steps      = 19073
+    max_steps      = 1000
     val_loss_steps = 20
 
     def get_lr(it):
@@ -218,6 +222,11 @@ if __name__ == "__main__":
     logger.info(f"num decayed parameter tensors: {len(decay_params)}, with {sum(p.numel() for p in decay_params):,} params")
     logger.info(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {sum(p.numel() for p in nodecay_params):,} params")
     logger.info(f"using fused AdamW: {optimizer.defaults.get('fused', False)}")
+
+    # MoE checks
+    if raw_model.config.use_moe:
+        assert raw_model.config.top_k <= raw_model.config.n_experts, f"top_k={raw_model.config.top_k} > n_experts={raw_model.config.n_experts}"
+        logger.info(f"using MoE every {raw_model.config.moe_every} layer with {raw_model.config.n_experts} experts")
 
     # wrap model into DDP container
     if ddp:
@@ -339,8 +348,8 @@ if __name__ == "__main__":
         tokens_per_sec = tokens_processed / dt
 
         # logging
-        if raw_model.use_moe:
-            moe_stats = {}
+        moe_stats = {}
+        if raw_model.config.use_moe:
             for ind, block in enumerate(raw_model.transformer.h):
                 if isinstance(block.mlp, MoE):
                     for k, v in block.mlp.stats.items():
