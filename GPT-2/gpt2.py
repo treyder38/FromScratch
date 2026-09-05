@@ -7,10 +7,52 @@ import tiktoken
 import numpy as np
 import torch.nn as nn
 import torch.distributed
+import json, logging, datetime
 from dataclasses import dataclass
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+
+
+class Logger:
+    def __init__(self, log_dir, run_name, enabled=True):
+        self.enabled = enabled
+        if not enabled:
+            return
+        self.run_dir = os.path.join(log_dir, run_name)
+        os.makedirs(self.run_dir, exist_ok=True)
+        self.config_path = os.path.join(self.run_dir, "config.json")
+        self.metrics = open(os.path.join(self.run_dir, "train.jsonl"), "a")
+
+        self.log = logging.getLogger(run_name)
+        self.log.setLevel(logging.INFO)
+        self.log.propagate = False
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s", datefmt="%H:%M:%S"))
+        self.log.addHandler(handler)
+
+    def set_config(self, config):
+        if not self.enabled:
+            return
+        with open(self.config_path, "w") as f:
+            json.dump(config, f, indent=2, default=str)
+        self.info(f"config saved to {self.config_path}")
+
+    def metric(self, **kw):
+        if not self.enabled:
+            return
+        self.metrics.write(json.dumps(kw) + "\n")
+        self.metrics.flush()
+        self.info(" | ".join(f"{k} {v:.5g}" if isinstance(v, float) else f"{k} {v}"
+                             for k, v in kw.items()))
+
+    def info(self, msg):
+        if self.enabled:
+            self.log.info(msg)
+
+    def close(self):
+        if self.enabled:
+            self.metrics.close()
 
 # -----------------------------------
 
@@ -99,8 +141,7 @@ class DataLoaderLite:
         self.shards = shards
 
         assert len(self.shards) > 0, f"no shards found for split {split}" 
-        if master_process:
-            print(f"found {len(self.shards)} shards for split {split}")
+        logger.info(f"found {len(self.shards)} shards for split {split}")
 
         self.reset()
 
@@ -182,63 +223,14 @@ class GPT(nn.Module):
         num_decay_params   = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
 
-        if master_process:
-            print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} params")
-            print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,}, params")
+        logger.info(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} params")
+        logger.info(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,}, params")
 
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and 'cuda' in str(device)
-        if master_process:
-            print(f"using fused AdamW: {use_fused}")
+        logger.info(f"using fused AdamW: {use_fused}")
         optimizer = torch.optim.AdamW(optim_groups, lr=lr, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
         return optimizer
-
-    @classmethod
-    def from_pretrained(cls, model_type):
-        """Loads pretrained GPT-2 model weights from huggingface"""
-
-        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-        from transformers import GPT2LMHeadModel
-        print("loading weights from pretrained gpt: %s" % model_type)
-
-        # n_layer, n_head and n_embd are determined from model_type
-        config_args = {
-            'gpt2':         dict(n_layer=12, n_head=12, n_emb=768),
-            'gpt2-medium':  dict(n_layer=24, n_head=16, n_emb=1024),
-            'gpt2-large':   dict(n_layer=36, n_head=20, n_emb=1280),
-            'gpt2-xl':      dict(n_layer=48, n_head=25, n_emb=1600),
-        }[model_type]
-        config_args['vocab_size'] = 50257
-        config_args['block_size'] = 1024
-
-        config = GPTconfig(**config_args)
-        model = GPT(config)
-        sd = model.state_dict()
-        sd_keys = sd.keys()
-        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
-
-        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
-        sd_hf = model_hf.state_dict()
-
-        # copy while ensuring all of the parameters are aligned and match in names and shapes
-        sd_keys_hf = sd_hf.keys()
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
-        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
-        for k in sd_keys_hf:
-            if any(k.endswith(w) for w in transposed):
-                # special treatment for the Conv1D weights we need to transpose
-                assert sd_hf[k].shape[::-1] == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k].t())
-            else:
-                # vanilla copy over the other parameters
-                assert sd_hf[k].shape == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k])
-
-        return model
 
     def forward(self, idx, targets=None):
         B, T = idx.size()
@@ -288,7 +280,12 @@ if __name__ == "__main__":
             device = "cuda"
         elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             device = "mps"
-        print(f"using device: {device}")
+
+    # setup logger
+    run_name = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_dir = "log"
+    logger = Logger(log_dir, run_name, enabled=master_process)
+    logger.info(f"using device: {device}")
 
     # reproducibility
     torch.manual_seed(1337)
@@ -303,16 +300,16 @@ if __name__ == "__main__":
     B, T = 64, 1024      # micro batch size & context length
     assert batch_size % (B * T * ddp_world_size) == 0, f"make sure total_batch_size is divisible by B * T * ddp_world_size"
     grad_accum_steps = batch_size // (B * T * ddp_world_size)
-    if master_process:
-        print(f"total desired batch size: {batch_size}")
-        print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+    logger.info(f"total desired batch size: {batch_size}")
+    logger.info(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
     # data loader related to its process_rank
     train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
     val_loader   = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
 
     # create model
-    model = GPT(GPTconfig(vocab_size=50304))
+    vocab_size = 50304
+    model = GPT(GPTconfig(vocab_size=vocab_size))
     model.to(device)
     raw_model = model
 
@@ -334,24 +331,37 @@ if __name__ == "__main__":
         return min_lr + coeff * (max_lr - min_lr)
 
     # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
-    optimizer = model.configure_optimizer(weight_decay=0.1, lr=max_lr, device=device)
+    weight_decay = 0.1
+    optimizer = model.configure_optimizer(weight_decay=weight_decay, lr=max_lr, device=device)
 
     # wrap model into DDP container
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank])
 
     # compile the model
-    if master_process: print("compiling the model...")
+    logger.info("compiling the model...")
     model = torch.compile(model)
+
+    # logger config
+    logger.set_config({
+        **vars(GPTconfig(vocab_size=vocab_size)),
+        "batch_size": batch_size, "B": B, "T": T,
+        "max_lr": max_lr, "min_lr": min_lr,
+        "warmup_steps": warmup_steps, "max_steps": max_steps,
+        "world_size": ddp_world_size, "weight_decay": weight_decay,
+    })
 
     # main loop
     for step in range(max_steps):
 
-        t0 = time.time()
-
         # validation
         if step % 100 == 0:
+
             model.eval()
+
+            if device.startswith("cuda"): torch.cuda.synchronize()
+            t0 = time.time()
+
             val_loader.reset()
             with torch.no_grad():
                 val_loss_accum = torch.zeros((), device=device)
@@ -366,8 +376,13 @@ if __name__ == "__main__":
             # average val_loss_accum across all processes
             if ddp:
                 torch.distributed.all_reduce(val_loss_accum, op=torch.distributed.ReduceOp.AVG)
-            if master_process: 
-                print(f"step {step:5d} | val loss {val_loss_accum.item():.5f}")
+
+            if device.startswith("cuda"): torch.cuda.synchronize()
+            t1 = time.time()
+            dt = t1 - t0
+
+            logger.metric(step=step, split="val", loss=val_loss_accum.item(), dt=dt)
+                
 
         # sample tokens from the model
         if step > 0 and step % 1000 == 0:
@@ -401,10 +416,14 @@ if __name__ == "__main__":
             for i in range(num_return_sequences):
                 tokens = xgen[i, :max_length].tolist()
                 decoded = enc.decode(tokens)
-                print(f"rank {ddp_rank} sample {i} => {decoded}")
+                logger.info(f"rank {ddp_rank} sample {i} => {decoded}")
 
         # train
         model.train()
+
+        if device.startswith("cuda"): torch.cuda.synchronize()
+        t0 = time.time()
+
         optimizer.zero_grad()
         loss_accum = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -432,26 +451,35 @@ if __name__ == "__main__":
             param_group['lr'] = lr
         optimizer.step()
 
-        torch.cuda.synchronize()
+        if device.startswith("cuda"): torch.cuda.synchronize()
         t1 = time.time()
         dt = t1 - t0
         tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
         tokens_per_sec = tokens_processed / dt
 
         # logging
-        if master_process:
-            print(f"step {step:5d} | loss {loss_accum.item():.5f} | lr {lr:.4e} | norm {norm.item():.4f} | dt: {dt:.2f}s | tok/sec {tokens_per_sec:.2f}")
+        logger.metric(step=step, split="train", loss=loss_accum.item(),
+                      lr=lr, grad_norm=norm.item(), dt=dt, tok_per_sec=tokens_per_sec,
+                      mem_gb=torch.cuda.max_memory_allocated() / 1e9 if device.startswith("cuda") else 0)
 
         # save checkpoint
-        os.makedirs("log", exist_ok=True)
         if master_process and (step > 0 and (step % 5000 == 0 or step == max_steps - 1)):
-            print(f"saving checkpoint at step {step}...")
+            logger.info(f"saving checkpoint at step {step}...")
             torch.save({
                 'model': raw_model.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'step': step,
                 'config': raw_model.config,
-            }, f"log/ckpt_{step:05d}.pt")
+                'train_loader': {'shard': train_loader.current_shard, 
+                                 'position': train_loader.current_position},
+                'rng': {'torch': torch.get_rng_state(), 
+                        'cuda': torch.cuda.get_rng_state_all() if device.startswith("cuda") else None},
+                'val_loss': val_loss_accum.item(),
+                'run_name': run_name,
+            }, f"{log_dir}/{run_name}/ckpt_{step:05d}.pt")
+            
+    # close logger
+    logger.close()
 
     # cleanup all processes
     if ddp: destroy_process_group()
