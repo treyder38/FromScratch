@@ -1,5 +1,5 @@
 """
-HellaSwag validation for the nanoGPT-style model in gpt2.py
+HellaSwag validation for the nanoGPT-style model in gpt.py
 
 HellaSwag: https://github.com/rowanz/hellaswag
 Each example is a context plus 4 candidate endings, exactly one of which is correct.
@@ -24,6 +24,7 @@ Reference numbers (acc_norm on the 10042-example val split):
 """
 
 import os
+import sys
 import json
 import argparse
 import urllib.request
@@ -34,7 +35,11 @@ import torch.distributed as dist
 from torch.nn import functional as F
 from tqdm import tqdm
 
-from gpt2 import GPT, GPTconfig
+import gpt
+from gpt import GPT, GPTconfig
+
+# checkpoints saved before the gpt2.py -> gpt.py split pickled the config as gpt2.GPTconfig
+sys.modules.setdefault("gpt2", gpt)
 
 DATA_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hellaswag")
 DATA_URL = "https://raw.githubusercontent.com/rowanz/hellaswag/master/data/hellaswag_val.jsonl"
@@ -188,6 +193,8 @@ def evaluate_hellaswag(model, device, ddp_rank=0, ddp_world_size=1, limit=None, 
 def load_model_from_checkpoint(path, device):
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     config = ckpt.get("config") or GPTconfig()
+    if isinstance(config, dict):
+        config = GPTconfig(**config)
     model = GPT(config)
 
     state = ckpt["model"]

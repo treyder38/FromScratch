@@ -2,16 +2,18 @@ import os
 import math 
 import time
 import torch 
-import inspect
 import tiktoken
 import numpy as np
-import torch.nn as nn
 import torch.distributed
 import json, logging, datetime
-from dataclasses import dataclass
+from dataclasses import asdict
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+
+from gpt import GPT, GPTconfig
+
+# -----------------------------------
 
 
 class Logger:
@@ -22,12 +24,12 @@ class Logger:
         self.run_dir = os.path.join(log_dir, run_name)
         os.makedirs(self.run_dir, exist_ok=True)
         self.config_path = os.path.join(self.run_dir, "config.json")
-        self.metrics = open(os.path.join(self.run_dir, "train.jsonl"), "a")
+        self.metrics = open(os.path.join(self.run_dir, "train.json"), "a")
 
         self.log = logging.getLogger(run_name)
         self.log.setLevel(logging.INFO)
-        self.log.propagate = False
-        handler = logging.StreamHandler()
+        self.log.propagate = False        # не отдавать сообщения root-логгеру
+        handler = logging.StreamHandler() # только терминал
         handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s", datefmt="%H:%M:%S"))
         self.log.addHandler(handler)
 
@@ -54,70 +56,6 @@ class Logger:
         if self.enabled:
             self.metrics.close()
 
-# -----------------------------------
-
-class MLP(nn.Sequential):
-
-    def __init__(self, config):
-        super().__init__()
-        self.c_fc   = nn.Linear(config.n_emb, 4 * config.n_emb)
-        self.gelu   = nn.GELU(approximate='tanh')
-        self.c_proj = nn.Linear(4 * config.n_emb, config.n_emb)
-        self.c_proj.NANOGPT_SCALE_INIT = 1
-
-
-class CausalSelfAttention(nn.Module):
-
-    def __init__(self, config):
-        super().__init__()
-        assert config.n_emb % config.n_head == 0
-
-        self.c_attn = nn.Linear(config.n_emb, 3 * config.n_emb)
-
-        # output projection
-        self.c_proj = nn.Linear(config.n_emb, config.n_emb)
-        self.c_proj.NANOGPT_SCALE_INIT = 1
-        
-        self.n_head = config.n_head
-        self.n_emb = config.n_emb
-
-        # bias in HF implementation = mask
-        # self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-        #                      .view(1, 1, config.block_size, config.block_size))
-        
-    def forward(self, x):
-        B, T, C = x.shape
-        qkv = self.c_attn(x) # (B, T, 3 * C)
-        q, k, v = qkv.split(self.n_emb, dim=2) # (B, T, C) 3 times
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, n_head, T, head_size)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) 
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-
-        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))     # (B, n_head, T, T)
-        # att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))  # (B, n_head, T, T)
-        # att = F.softmax(att, dim=-1)
-        # y = att @ v # (B, n_head, T, T) @ (B, n_head, T, head_size) -> (B, n_head, T, head_size)
-
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
-
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        y = self.c_proj(y)
-        return y
-
-
-class Block(nn.Module):
-
-    def __init__(self, config):
-        super().__init__()
-        self.ln_1 = nn.LayerNorm(config.n_emb)
-        self.ln_2 = nn.LayerNorm(config.n_emb)
-        self.attn = CausalSelfAttention(config)
-        self.mlp = MLP(config)
-
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x)) # Pre Norm
-        x = x + self.mlp(self.ln_2(x))
-        return x
 
 # -----------------------------------
 
@@ -127,7 +65,7 @@ def load_tokens(filename):
 
 class DataLoaderLite:
 
-    def __init__(self, B, T, process_rank, num_processes, split):
+    def __init__(self, B, T, process_rank, num_processes, split, data_root="edu_fineweb10B"):
         self.B = B
         self.T = T
         self.process_rank = process_rank
@@ -135,13 +73,11 @@ class DataLoaderLite:
         assert split in {'train', 'val'}
 
         # get the shard filenames
-        data_root = "edu_fineweb10B"
         shards = sorted([s for s in os.listdir(data_root) if split in s])
         shards = [os.path.join(data_root, s) for s in shards]
         self.shards = shards
 
         assert len(self.shards) > 0, f"no shards found for split {split}" 
-        logger.info(f"found {len(self.shards)} shards for split {split}")
 
         self.reset()
 
@@ -161,98 +97,6 @@ class DataLoaderLite:
             self.tokens = load_tokens(self.shards[self.current_shard])
             self.current_position = self.B * self.T * self.process_rank
         return x, y
-
-# -----------------------------------
-
-
-@dataclass
-class GPTconfig:
-    block_size: int = 1024 # max sequence length
-    vocab_size: int = 50257
-    n_layer: int = 12
-    n_head: int = 12
-    n_emb: int = 768
-
-
-class GPT(nn.Module):
-
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.transformer = nn.ModuleDict(
-            dict(
-                wte = nn.Embedding(config.vocab_size, config.n_emb),
-                wpe = nn.Embedding(config.block_size, config.n_emb),
-                h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-                ln_f = nn.LayerNorm(config.n_emb)
-            )
-        )
-        self.lm_head = nn.Linear(config.n_emb, config.vocab_size, bias=False)
-
-        # weights tying
-        self.transformer.wte.weight = self.lm_head.weight
-        
-        # init params
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        std = 0.02
-        if isinstance(module, nn.Linear):
-
-            if hasattr(module, 'NANOGPT_SCALE_INIT'):
-                std *= (2 * self.config.n_layer) ** -0.5
-
-            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
-
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-
-        elif isinstance(module, nn. Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
-
-    def configure_optimizer(self, weight_decay, lr, device):
-        params_dict = {p_name : p for p_name, p in self.named_parameters() if p.requires_grad}
-        decay_params   = [p for p in params_dict.values() if p.dim() >= 2]
-        nodecay_params = [p for p in params_dict.values() if p.dim() < 2]
-
-        optim_groups = [
-            {'params': decay_params,   'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
-        ]
-
-        num_decay_params   = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-
-        logger.info(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} params")
-        logger.info(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,}, params")
-
-        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and 'cuda' in str(device)
-        logger.info(f"using fused AdamW: {use_fused}")
-        optimizer = torch.optim.AdamW(optim_groups, lr=lr, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
-        return optimizer
-
-    def forward(self, idx, targets=None):
-        B, T = idx.size()
-        assert T <= self.config.block_size, f"model's input can't be more than {self.config.block_size} tokens"
-
-        pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # (T)
-        pos_emb = self.transformer.wpe(pos) # (T, n_emb)
-        tok_emb = self.transformer.wte(idx) # (B, T, n_emb)
-
-        x = tok_emb + pos_emb # (B, T, n_emb)
-        for block in self.transformer.h:
-            x = block(x)
-
-        x = self.transformer.ln_f(x) 
-        logits = self.lm_head(x) # (B, T, vocab_size)
-
-        loss = None
-        if targets is not None:
-            loss = F.cross_entropy(logits.view(B * T, logits.size(-1)), targets.view(B * T))
-
-        return logits, loss
-
 
 # -----------------------------------
 
@@ -306,6 +150,8 @@ if __name__ == "__main__":
     # data loader related to its process_rank
     train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
     val_loader   = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
+    logger.info(f"found {len(train_loader.shards)} shards for split train")
+    logger.info(f"found {len(val_loader.shards)} shards for split val")
 
     # create model
     vocab_size = 50304
@@ -330,9 +176,13 @@ if __name__ == "__main__":
         coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
         return min_lr + coeff * (max_lr - min_lr)
 
-    # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+    # optimizer
     weight_decay = 0.1
-    optimizer = model.configure_optimizer(weight_decay=weight_decay, lr=max_lr, device=device)
+    optimizer = raw_model.configure_optimizer(weight_decay=weight_decay, lr=max_lr, device=device)
+    decay_params, nodecay_params = optimizer.param_groups[0]['params'], optimizer.param_groups[1]['params']
+    logger.info(f"num decayed parameter tensors: {len(decay_params)}, with {sum(p.numel() for p in decay_params):,} params")
+    logger.info(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {sum(p.numel() for p in nodecay_params):,} params")
+    logger.info(f"using fused AdamW: {optimizer.defaults.get('fused', False)}")
 
     # wrap model into DDP container
     if ddp:
@@ -344,7 +194,7 @@ if __name__ == "__main__":
 
     # logger config
     logger.set_config({
-        **vars(GPTconfig(vocab_size=vocab_size)),
+        **asdict(raw_model.config),
         "batch_size": batch_size, "B": B, "T": T,
         "max_lr": max_lr, "min_lr": min_lr,
         "warmup_steps": warmup_steps, "max_steps": max_steps,
@@ -382,7 +232,6 @@ if __name__ == "__main__":
             dt = t1 - t0
 
             logger.metric(step=step, split="val", loss=val_loss_accum.item(), dt=dt)
-                
 
         # sample tokens from the model
         if step > 0 and step % 1000 == 0:
@@ -464,22 +313,21 @@ if __name__ == "__main__":
 
         # save checkpoint
         if master_process and (step > 0 and (step % 5000 == 0 or step == max_steps - 1)):
-            logger.info(f"saving checkpoint at step {step}...")
+            ckpt_path = os.path.join(log_dir, run_name, f"ckpt_{step:05d}.pt")
+            logger.info(f"saving checkpoint at step {step} -> {ckpt_path}")
             torch.save({
                 'model': raw_model.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'step': step,
-                'config': raw_model.config,
+                'config': asdict(raw_model.config),  # plain dict: loadable without importing this module
                 'train_loader': {'shard': train_loader.current_shard, 
                                  'position': train_loader.current_position},
                 'rng': {'torch': torch.get_rng_state(), 
                         'cuda': torch.cuda.get_rng_state_all() if device.startswith("cuda") else None},
                 'val_loss': val_loss_accum.item(),
                 'run_name': run_name,
-            }, f"{log_dir}/{run_name}/ckpt_{step:05d}.pt")
-            
-    # close logger
-    logger.close()
+            }, ckpt_path)
 
     # cleanup all processes
+    logger.close()
     if ddp: destroy_process_group()

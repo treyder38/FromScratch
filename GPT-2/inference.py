@@ -1,9 +1,13 @@
-import gpt2
+import sys
+import gpt
 import time
 import torch 
 import tiktoken
 from torch.nn import functional as F
-from gpt2 import GPT, GPTconfig
+from gpt import GPT, GPTconfig
+
+# checkpoints saved before the gpt2.py -> gpt.py split pickled the config as gpt2.GPTconfig
+sys.modules.setdefault("gpt2", gpt)
 
 # ----------------------
 
@@ -86,8 +90,8 @@ def block_forward(self, x, cache=None):
     return x
 
 
-gpt2.CausalSelfAttention.forward = attn_forward
-gpt2.Block.forward = block_forward
+gpt.CausalSelfAttention.forward = attn_forward
+gpt.Block.forward = block_forward
 
 
 # ----------------------
@@ -107,7 +111,10 @@ if __name__ == "__main__":
 
     print("loading model...")
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    model = GPT(ckpt['config'])
+    config = ckpt['config']
+    if isinstance(config, dict):
+        config = GPTconfig(**config)
+    model = GPT(config)
     sd = ckpt['model']
     sd = {k.replace('_orig_mod.', ''): v for k, v in sd.items()}
     model.load_state_dict(sd)
