@@ -1,0 +1,5 @@
+.venv/
+log/
+*.pt
+hellaswag/
+edu_fineweb10B/
