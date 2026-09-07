@@ -231,11 +231,17 @@ class GPT(nn.Module):
 
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.view(B * T, logits.size(-1)), targets.view(B * T))
-            # add low balancing loss
+            loss_ce = F.cross_entropy(logits.view(B * T, logits.size(-1)), targets.view(B * T))
+            loss = loss_ce
+            # add load balancing and router z-loss (summed over MoE layers)
             if self.config.use_moe:
                 loss_lb = sum(b.mlp.aux for b in self.transformer.h if isinstance(b.mlp, MoE))
                 loss_z  = sum(b.mlp.z_loss for b in self.transformer.h if isinstance(b.mlp, MoE))
-                loss += self.config.lb_loss_coef * loss_lb + self.config.z_loss_coef * loss_z
+                loss = loss + self.config.lb_loss_coef * loss_lb + self.config.z_loss_coef * loss_z
+            # components of the last loss, for logging. clone(): the caller may modify `loss` in place
+            # (e.g. loss /= grad_accum_steps) and for a dense model `loss` IS loss_ce
+            self.loss_stats = {"ce": loss_ce.detach().clone()}
+            if self.config.use_moe:
+                self.loss_stats.update(lb=loss_lb.detach().clone(), z=loss_z.detach().clone())
 
         return logits, loss

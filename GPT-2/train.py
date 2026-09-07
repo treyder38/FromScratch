@@ -261,6 +261,7 @@ if __name__ == "__main__":
             val_loader.reset()
             with torch.no_grad():
                 val_loss_accum = torch.zeros((), device=device)
+                val_parts = {}   # ce / lb / z, averaged the same way as the total loss
                 for _ in range(cfg.val_loss_steps):
                     x, y = val_loader.next_batch()
                     x, y = x.to(device), y.to(device)
@@ -268,16 +269,21 @@ if __name__ == "__main__":
                         logits, loss = model(x, y)
                     loss /= cfg.val_loss_steps
                     val_loss_accum += loss.detach()
+                    for k, v in raw_model.loss_stats.items():
+                        val_parts[k] = val_parts.get(k, 0) + v / cfg.val_loss_steps
 
-            # average val_loss_accum across all processes
+            # average across all processes
             if ddp:
                 torch.distributed.all_reduce(val_loss_accum, op=torch.distributed.ReduceOp.AVG)
+                for v in val_parts.values():
+                    torch.distributed.all_reduce(v, op=torch.distributed.ReduceOp.AVG)
 
             if device.startswith("cuda"): torch.cuda.synchronize()
             t1 = time.time()
             dt = t1 - t0
 
-            logger.metric(step=step, split="val", loss=val_loss_accum.item(), dt=dt)
+            logger.metric(step=step, split="val", loss=val_loss_accum.item(),
+                          **{k: v.item() for k, v in val_parts.items()}, dt=dt)
 
         # sample tokens from the model
         if step > 0 and step % cfg.sample_every == 0:
@@ -315,6 +321,7 @@ if __name__ == "__main__":
 
         optimizer.zero_grad()
         loss_accum = torch.zeros((), device=device)
+        loss_parts = {}   # ce / lb / z, averaged the same way as the total loss
         for micro_step in range(grad_accum_steps):
             x, y = train_loader.next_batch()
             x, y = x.to(device), y.to(device)
@@ -322,14 +329,18 @@ if __name__ == "__main__":
                 logits, loss = model(x, y)
             loss /= grad_accum_steps
             loss_accum += loss.detach()
+            for k, v in raw_model.loss_stats.items():
+                loss_parts[k] = loss_parts.get(k, 0) + v / grad_accum_steps
             # sync gradients only after the last micro batch
             if ddp: 
                 model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
             loss.backward()
 
-        # average loss_accum across all processes
+        # average across all processes
         if ddp: 
             torch.distributed.all_reduce(loss_accum, op=torch.distributed.ReduceOp.AVG)
+            for v in loss_parts.values():
+                torch.distributed.all_reduce(v, op=torch.distributed.ReduceOp.AVG)
         
         # gradients cliping
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
@@ -355,6 +366,7 @@ if __name__ == "__main__":
                         moe_stats[f"{k}_l{ind}"] = v.item()
 
         logger.metric(step=step, split="train", loss=loss_accum.item(),
+                      **{k: v.item() for k, v in loss_parts.items()},
                       lr=lr, grad_norm=norm.item(), dt=dt, tok_per_sec=tokens_per_sec,
                       mem_gb=torch.cuda.max_memory_allocated() / 1e9 if device.startswith("cuda") else 0,
                       **moe_stats)

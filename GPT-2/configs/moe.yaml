@@ -1,4 +1,4 @@
-# GPT-2 124M body with MoE in place of every MLP. Short run for routing experiments.
+# GPT-2 124M body with MoE in place of every MLP.
 #   torchrun --standalone --nproc_per_node=4 train.py --config configs/moe.yaml
 
 model:
@@ -8,7 +8,7 @@ model:
   n_head: 12
   n_emb: 768
   use_moe: true
-  n_experts: 2
+  n_experts: 8
   top_k: 2
   moe_every: 1
   lb_loss_coef: 0.01
@@ -21,7 +21,7 @@ train:
   max_lr: 6.0e-4
   min_lr_ratio: 0.1
   warmup_steps: 715
-  max_steps: 1000
+  max_steps: 19073
   weight_decay: 0.1
   grad_clip: 1.0
   seed: 1337
