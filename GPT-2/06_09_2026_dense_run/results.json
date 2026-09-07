@@ -1,0 +1,19 @@
+{
+  "run": "20260906_000731",
+  "config": "configs/dense.yaml",
+  "checkpoint": "log/20260906_000731/ckpt_19072.pt",
+  "steps": 19073,
+  "tokens": 10000000000,
+  "world_size": 4,
+  "val_loss": 3.2605,
+  "train_loss_last100_mean": 3.2347,
+  "hellaswag": {
+    "split": "val",
+    "num_examples": 10042,
+    "acc": 0.2786,
+    "acc_norm": 0.2837,
+    "command": "torchrun --nproc_per_node=4 hellaswag.py --ckpt log/20260906_000731/ckpt_19072.pt",
+    "date": "2026-09-07"
+  },
+  "reference_acc_norm": {"random": 0.25, "gpt2_124m_openai": 0.296, "gpt3_124m": 0.337}
+}
