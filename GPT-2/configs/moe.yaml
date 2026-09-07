@@ -29,7 +29,7 @@ train:
   compile: true
 
   val_every: 100
-  val_loss_steps: 20
+  val_loss_steps: 40
   sample_every: 1000
   num_samples: 4
   sample_len: 32
