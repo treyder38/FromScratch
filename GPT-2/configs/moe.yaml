@@ -21,7 +21,7 @@ train:
   max_lr: 6.0e-4
   min_lr_ratio: 0.1
   warmup_steps: 715
-  max_steps: 19073
+  max_steps: 100 # 19073
   weight_decay: 0.1
   grad_clip: 1.0
   seed: 1337

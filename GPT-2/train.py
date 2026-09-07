@@ -248,6 +248,7 @@ if __name__ == "__main__":
                        "world_size": ddp_world_size, "grad_accum_steps": grad_accum_steps})
 
     # main loop
+    logger.info("starting the train loop...")
     for step in range(max_steps):
 
         # validation
