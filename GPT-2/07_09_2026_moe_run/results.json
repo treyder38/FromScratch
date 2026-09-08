@@ -1,0 +1,19 @@
+{
+  "run": "20260907_232531",
+  "config": "configs/moe.yaml (8 experts, top-2, lb 0.01, z 1e-3, MoE in all 12 layers)",
+  "checkpoint": "log/20260907_232531/ckpt_19072.pt",
+  "steps": 19073,
+  "tokens": 10000000000,
+  "world_size": 4,
+  "val_ce": 3.1126,
+  "val_loss_total": 3.3529,
+  "train_ce_last100_mean": 3.0982,
+  "dense_val_ce": 3.2605,
+  "gap_vs_dense": -0.1479,
+  "step_time_s": 1.637,
+  "tok_per_sec": 320275,
+  "wall_hours": 8.7,
+  "peak_mem_gb": 52.1,
+  "ckpt_size_gb": 6.26,
+  "hellaswag": null
+}

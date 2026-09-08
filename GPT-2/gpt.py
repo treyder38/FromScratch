@@ -28,11 +28,11 @@ class GPTconfig:
 
 class MLP(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, hidden_multiplier):
         super().__init__()
-        self.c_fc   = nn.Linear(config.n_emb, 4 * config.n_emb)
+        self.c_fc   = nn.Linear(config.n_emb, hidden_multiplier * config.n_emb)
         self.gelu   = nn.GELU(approximate='tanh')
-        self.c_proj = nn.Linear(4 * config.n_emb, config.n_emb)
+        self.c_proj = nn.Linear(hidden_multiplier * config.n_emb, config.n_emb)
         self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
@@ -58,11 +58,11 @@ class Router(nn.Module):
 
 class MoE(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, hidden_multiplier):
         super().__init__()
         self.top_k = config.top_k
         self.n_experts = config.n_experts
-        self.experts = nn.ModuleList([MLP(config) for _ in range(config.n_experts)])
+        self.experts = nn.ModuleList([MLP(config, hidden_multiplier) for _ in range(config.n_experts)])
         self.router = Router(config)
         self.stats = {}
         self.aux = 0.0
@@ -150,9 +150,9 @@ class Block(nn.Module):
         self.ln_2 = nn.LayerNorm(config.n_emb)
         self.attn = CausalSelfAttention(config)
         if config.use_moe and layer_ind % config.moe_every == 0:
-            self.mlp = MoE(config)
+            self.mlp = MoE(config, hidden_multiplier=2)
         else:
-            self.mlp = MLP(config)
+            self.mlp = MLP(config, hidden_multiplier=4)
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x)) # Pre Norm
