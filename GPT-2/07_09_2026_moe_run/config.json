@@ -1,0 +1,42 @@
+{
+  "note": "experts had 4 * n_emd hidden size, so amount of active params is bigger than in 06_09_2026 run",
+  "model": {
+    "block_size": 1024,
+    "vocab_size": 50304,
+    "n_layer": 12,
+    "n_head": 12,
+    "n_emb": 768,
+    "use_moe": true,
+    "n_experts": 8,
+    "top_k": 2,
+    "moe_every": 1,
+    "lb_loss_coef": 0.01,
+    "z_loss_coef": 0.001
+  },
+  "train": {
+    "batch_size": 524288,
+    "B": 32,
+    "T": 1024,
+    "max_lr": 0.0006,
+    "min_lr_ratio": 0.1,
+    "warmup_steps": 715,
+    "max_steps": 19073,
+    "weight_decay": 0.1,
+    "grad_clip": 1.0,
+    "seed": 1337,
+    "data_root": "edu_fineweb10B",
+    "compile": true,
+    "val_every": 100,
+    "val_loss_steps": 40,
+    "sample_every": 1000,
+    "num_samples": 4,
+    "sample_len": 32,
+    "sample_prompt": "Hello, I'm a language model,",
+    "ckpt_every": 5000,
+    "log_dir": "log",
+    "wandb_project": "gpt2-fromscratch"
+  },
+  "config_file": "configs/moe.yaml",
+  "world_size": 4,
+  "grad_accum_steps": 4
+}
