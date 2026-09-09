@@ -26,22 +26,6 @@ class GPTconfig:
     z_loss_coef: float = 1e-3   # router z-loss
 
 
-class MLP(nn.Module):
-
-    def __init__(self, config, hidden_multiplier):
-        super().__init__()
-        self.c_fc   = nn.Linear(config.n_emb, hidden_multiplier * config.n_emb)
-        self.gelu   = nn.GELU(approximate='tanh')
-        self.c_proj = nn.Linear(hidden_multiplier * config.n_emb, config.n_emb)
-        self.c_proj.NANOGPT_SCALE_INIT = 1
-
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-        return x
-
-
 class RMSNorm(nn.Module):
     """Replaced with fused pytorch implementation in my GPT."""
     def __init__(self, dim):
@@ -52,6 +36,33 @@ class RMSNorm(nn.Module):
     def forward(self, x):
         rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
         return x / rms * self.gamma
+
+
+class SwiGLU(nn.Module):
+
+    def __init__(self, dim, hidden):
+        super().__init__()
+        self.W_up   = nn.Linear(dim, hidden, bias=False)
+        self.W_gate = nn.Linear(dim, hidden, bias=False)
+        self.gate_f = nn.SiLU()
+
+    def forward(self, x):
+        return self.W_up(x) * self.gate_f(self.W_gate(x))
+    
+
+class MLP(nn.Module):
+
+    def __init__(self, config, hidden_multiplier):
+        super().__init__()
+        hidden = int(2 / 3 * hidden_multiplier * config.n_emb)
+        self.swiglu = SwiGLU(config.n_emb, hidden)
+        self.c_proj = nn.Linear(hidden, config.n_emb)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
+
+    def forward(self, x):
+        x = self.swiglu(x)
+        x = self.c_proj(x)
+        return x
 
 
 class Router(nn.Module):
