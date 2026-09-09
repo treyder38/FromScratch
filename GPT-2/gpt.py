@@ -42,6 +42,18 @@ class MLP(nn.Module):
         return x
 
 
+class RMSNorm(nn.Module):
+    """Replaced with fused pytorch implementation in my GPT."""
+    def __init__(self, dim):
+        super().__init__()
+        self.eps = 1e-6
+        self.gamma = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return x / rms * self.gamma
+
+
 class Router(nn.Module):
 
     def __init__(self, config):
@@ -146,8 +158,8 @@ class Block(nn.Module):
 
     def __init__(self, config, layer_ind):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(config.n_emb)
-        self.ln_2 = nn.LayerNorm(config.n_emb)
+        self.ln_1 = nn.RMSNorm(config.n_emb)
+        self.ln_2 = nn.RMSNorm(config.n_emb)
         self.attn = CausalSelfAttention(config)
         if config.use_moe and layer_ind % config.moe_every == 0:
             self.mlp = MoE(config, hidden_multiplier=2)
@@ -172,7 +184,7 @@ class GPT(nn.Module):
                 wte = nn.Embedding(config.vocab_size, config.n_emb),
                 wpe = nn.Embedding(config.block_size, config.n_emb),
                 h = nn.ModuleList([Block(config, ind) for ind in range(config.n_layer)]),
-                ln_f = nn.LayerNorm(config.n_emb)
+                ln_f = nn.RMSNorm(config.n_emb)
             )
         )
         self.lm_head = nn.Linear(config.n_emb, config.vocab_size, bias=False)
