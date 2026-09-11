@@ -15,5 +15,21 @@
   "wall_hours": 8.7,
   "peak_mem_gb": 52.1,
   "ckpt_size_gb": 6.26,
-  "hellaswag": null
+  "hellaswag": {
+    "split": "val",
+    "num_examples": 10042,
+    "acc": 0.2861,
+    "acc_norm": 0.3011,
+    "dense_acc_norm": 0.2837,
+    "gap_vs_dense": 0.0174,
+    "command": "python hellaswag.py --ckpt log/20260907_232531/ckpt_19072.pt  (code at commit 3261a4f)",
+    "date": "2026-09-11"
+  },
+  "code_commit": "3261a4f",
+  "params": {
+    "total_M": 521.2,
+    "active_per_token_M": 181.2,
+    "expert_hidden": 4,
+    "note": "1.66x block FLOPs per token vs dense; not iso-compute"
+  }
 }
