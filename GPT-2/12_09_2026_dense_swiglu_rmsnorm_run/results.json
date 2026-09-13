@@ -1,0 +1,23 @@
+{
+  "run": "20260912_152429",
+  "config": "configs/dense.yaml; code at 80e8e8c: nn.RMSNorm instead of LayerNorm, SwiGLU MLP (hidden 2048, no bias in W_up/W_gate) instead of GELU",
+  "checkpoint": "log/20260912_152429/ckpt_19072.pt",
+  "code_commit": "80e8e8c",
+  "steps": 19073,
+  "tokens": 10000000000,
+  "world_size": 1,
+  "grad_accum_steps": 8,
+  "params_M": 124.4,
+  "val_ce": 3.0799,
+  "train_ce_last100_mean": 3.0654,
+  "step_time_s": 1.148,
+  "peak_mem_gb": 43.5,
+  "hellaswag": {"split": "val", "num_examples": 10042, "acc": 0.2899, "acc_norm": 0.3010,
+                "command": "python hellaswag.py --ckpt log/20260912_152429/ckpt_19072.pt", "date": "2026-09-13"},
+  "vs_dense_06_09": {"val_ce_gap": -0.1806, "train_ce_gap": -0.1693, "hellaswag_acc_norm_gap": 0.0173},
+  "caveats": [
+    "single GPU (world_size 1) vs 4 GPUs for 06_09: val is computed on 20 chunks instead of 80, but the train-loss gap on identical data is the same size, so the val subset is not the explanation",
+    "gap is largest early (-0.44 at step 1000) and shrinks to -0.18 by the end: much bigger than SwiGLU+RMSNorm usually give; not yet separated from the single-GPU vs DDP change",
+    "config.json is identical to 06_09 because norm/mlp type are not in GPTconfig yet"
+  ]
+}

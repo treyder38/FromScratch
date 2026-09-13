@@ -2,6 +2,7 @@
 
     python plot_run.py log/<run_name>            # reads <dir>/train.jsonl, writes loss.png + diagnostics.png next to it
     python plot_run.py train.jsonl --out plots   # explicit file and output dir
+    python plot_run.py --compare run_a run_b run_c --out run_c    # val/train cross-entropy of several runs on one chart
 """
 import os
 import json
@@ -11,7 +12,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-BLUE, ORANGE = "#2a78d6", "#eb6834"
+BLUE, ORANGE, AQUA, YELLOW = "#2a78d6", "#eb6834", "#1baf7a", "#eda100"
 INK, INK2, GRID = "#0b0b0b", "#52514e", "#e6e5e1"
 
 plt.rcParams.update({
@@ -65,11 +66,39 @@ def plot_diagnostics(train, out):
     fig.tight_layout(); fig.savefig(out); plt.close(fig)
 
 
+def plot_compare(runs, out):
+    """runs: list of (label, train_df, val_df). Cross-entropy only, so MoE runs (loss = ce + aux) compare fairly."""
+    colors = [BLUE, ORANGE, AQUA, YELLOW]
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.5), dpi=150, gridspec_kw={"width_ratios": [3, 2]})
+    for (label, train, val), c in zip(runs, colors):
+        tce = train["ce"] if "ce" in train else train["loss"]; vce = val["ce"] if "ce" in val else val["loss"]
+        for ax in axes:
+            ax.plot(vce.index, vce, color=c, label=label)
+            ax.plot(tce.index, tce.rolling(100, min_periods=1).mean(), color=c, linewidth=0.8, alpha=0.5)
+        axes[1].annotate(f"{vce.iloc[-1]:.3f}", (vce.index[-1], vce.iloc[-1]), textcoords="offset points", xytext=(5, 0), color=INK2, fontsize=9)
+    ymin = min((v["ce"] if "ce" in v else v["loss"]).min() for _, _, v in runs)
+    axes[0].set_ylim(ymin - 0.1, 4.6); axes[0].set_title("val cross-entropy (bold) and 100-step train mean (thin)")
+    last = max(v.index[-1] for _, _, v in runs); axes[1].set_xlim(last * 0.6, last * 1.06); axes[1].set_ylim(ymin - 0.05, ymin + 0.4)
+    axes[1].set_title("last 40% of training, zoomed")
+    for ax in axes: ax.set_xlabel("step"); ax.set_ylabel("cross-entropy")
+    axes[0].legend(loc="upper right")
+    fig.tight_layout(); fig.savefig(out); plt.close(fig)
+
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("path", help="run directory containing train.jsonl, or the jsonl file itself")
-    p.add_argument("--out", default=None, help="output directory (default: next to the jsonl)")
+    p.add_argument("path", nargs="?", help="run directory containing train.jsonl, or the jsonl file itself")
+    p.add_argument("--compare", nargs="+", metavar="RUN", help="run directories to overlay on one chart (labels = directory names)")
+    p.add_argument("--out", default=None, help="output directory (default: next to the jsonl / last compared run)")
     a = p.parse_args()
+    if a.compare:
+        runs = [(os.path.basename(os.path.normpath(r)), *load(os.path.join(r, "train.jsonl"))) for r in a.compare]
+        out = a.out or a.compare[-1]; os.makedirs(out, exist_ok=True)
+        plot_compare(runs, os.path.join(out, "compare.png"))
+        for label, train, val in runs:
+            vce = val["ce"] if "ce" in val else val["loss"]; print(f"{label:40s} final val ce {vce.iloc[-1]:.4f}")
+        print(f"written: {out}/compare.png"); raise SystemExit
+    assert a.path, "give a run directory or use --compare"
     jsonl = a.path if a.path.endswith(".jsonl") else os.path.join(a.path, "train.jsonl")
     out = a.out or os.path.dirname(os.path.abspath(jsonl))
     os.makedirs(out, exist_ok=True)
